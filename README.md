@@ -4,13 +4,12 @@ Bulk disable (or enable) content on the [Amazon Kids Parent Dashboard](https://p
 
 ## How It Works
 
-The script uses a three-layer approach for speed and reliability:
+The script uses a two-layer approach for reliability:
 
 1. **React Fiber** — reads item data and pagination state directly from Amazon's React component tree (no fragile CSS selectors)
-2. **API Discovery** — intercepts one real toggle click to learn the API endpoint, then fires direct XHR requests in parallel for all remaining items
-3. **Semantic DOM Fallback** — if fiber or API access fails, falls back to `input[role="switch"]` and `aria-label` attributes
+2. **Semantic DOM Fallback** — if fiber access fails, falls back to `input[role="switch"]` and `aria-label` attributes
 
-With the direct API approach, it can process thousands of items in a few minutes instead of 10-15+ minutes with sequential DOM clicks.
+Toggling is done via concurrent DOM card clicks (the only method Amazon reliably persists). Items are clicked in parallel batches for speed.
 
 ## Usage
 
@@ -42,14 +41,14 @@ const CONFIG = {
   // Case-insensitive keyword matching
   keywordCaseSensitive: false,
 
-  // Parallel API requests (fast mode)
-  apiConcurrency: 5,
+  // Number of items to click at once before waiting
+  clickConcurrency: 5,
 
-  // Delay between DOM clicks in ms (fallback mode)
+  // Delay between click batches in ms
   clickDelayMs: 150,
 
   // Delay between pagination loads in ms
-  pageDelayMs: 500,
+  pageDelayMs: 100,
 
   // Max retries per failed toggle
   maxRetries: 3,

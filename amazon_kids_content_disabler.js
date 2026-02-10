@@ -36,10 +36,10 @@ const CONFIG = {
   // Case-insensitive keyword matching
   keywordCaseSensitive: false,
 
-  // Max ASINs per single API call (the endpoint accepts arrays)
-  apiBatchSize: 30,
+  // Number of items to click at once before waiting for responses
+  clickConcurrency: 5,
 
-  // Delay between individual DOM clicks in ms (fallback mode)
+  // Delay between click batches in ms
   clickDelayMs: 150,
 
   // Delay between pagination loads in ms
@@ -47,9 +47,6 @@ const CONFIG = {
 
   // Max retries per failed toggle
   maxRetries: 3,
-
-  // Base delay for exponential backoff in ms
-  retryBackoffMs: 1000,
 
   // Logging: 'quiet', 'normal', 'verbose'
   logLevel: 'normal',
@@ -200,121 +197,9 @@ const CONFIG = {
   };
 
   // --------------------------------------------------------------------------
-  // API Discovery — intercept one real XHR to learn the toggle endpoint
+  // (API approach removed — Amazon silently ignores direct XHR toggle calls
+  //  despite returning 200. Only DOM card clicks actually persist changes.)
   // --------------------------------------------------------------------------
-  const ApiLayer = {
-    _endpoint: null,
-    _csrfHeader: null,
-    _csrfValue: null,
-    _childId: null,
-    _discovered: false,
-
-    // Try to discover API by intercepting an XHR from one real card click
-    async discover(cardEl) {
-      return new Promise((resolve) => {
-        const origOpen = XMLHttpRequest.prototype.open;
-        const origSend = XMLHttpRequest.prototype.send;
-        const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
-        let captured = false;
-
-        XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-          this._capMethod = method;
-          this._capUrl = url;
-          this._capHeaders = {};
-          return origOpen.apply(this, [method, url, ...rest]);
-        };
-
-        XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
-          if (this._capHeaders) this._capHeaders[name] = value;
-          return origSetHeader.apply(this, arguments);
-        };
-
-        XMLHttpRequest.prototype.send = function (body) {
-          if (!captured && this._capMethod === 'POST' && this._capUrl &&
-              this._capUrl.includes('change-multi-item-status')) {
-            captured = true;
-            ApiLayer._endpoint = this._capUrl;
-
-            // Extract CSRF header
-            for (const [k, v] of Object.entries(this._capHeaders)) {
-              if (k.toLowerCase().includes('csrf')) {
-                ApiLayer._csrfHeader = k;
-                ApiLayer._csrfValue = v;
-              }
-            }
-
-            // Extract child ID from body
-            try {
-              const parsed = JSON.parse(body);
-              const childIds = Object.keys(parsed.childDirectedIdAllowlistStatusMap || {});
-              if (childIds.length > 0) ApiLayer._childId = childIds[0];
-            } catch (e) { /* ignore */ }
-
-            ApiLayer._discovered = true;
-
-            // Restore XHR prototypes
-            XMLHttpRequest.prototype.open = origOpen;
-            XMLHttpRequest.prototype.send = origSend;
-            XMLHttpRequest.prototype.setRequestHeader = origSetHeader;
-            resolve(true);
-          }
-          return origSend.apply(this, arguments);
-        };
-
-        // Trigger one real toggle via DOM click
-        cardEl.click();
-
-        // Timeout fallback
-        setTimeout(() => {
-          if (!captured) {
-            XMLHttpRequest.prototype.open = origOpen;
-            XMLHttpRequest.prototype.send = origSend;
-            XMLHttpRequest.prototype.setRequestHeader = origSetHeader;
-            resolve(false);
-          }
-        }, 8000);
-      });
-    },
-
-    // Make a direct XHR toggle call
-    toggleViaApi(asins, status) {
-      return new Promise((resolve, reject) => {
-        if (!this._discovered || !this._endpoint || !this._childId) {
-          reject(new Error('API not discovered'));
-          return;
-        }
-
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST', this._endpoint, true);
-        xhr.setRequestHeader('Accept', 'application/json');
-        xhr.setRequestHeader('Content-Type', 'application/json');
-        if (this._csrfHeader && this._csrfValue) {
-          xhr.setRequestHeader(this._csrfHeader, this._csrfValue);
-        }
-        xhr.withCredentials = true;
-
-        xhr.onload = () => {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            resolve(xhr.status);
-          } else if (xhr.status === 429) {
-            reject(new Error('Rate limited (429)'));
-          } else {
-            reject(new Error(`HTTP ${xhr.status}`));
-          }
-        };
-        xhr.onerror = () => reject(new Error('Network error'));
-        xhr.ontimeout = () => reject(new Error('Timeout'));
-        xhr.timeout = 15000;
-
-        const body = JSON.stringify({
-          childDirectedIdAllowlistStatusMap: { [this._childId]: status },
-          asins: Array.isArray(asins) ? asins : [asins],
-        });
-
-        xhr.send(body);
-      });
-    },
-  };
 
   // --------------------------------------------------------------------------
   // Item Data Source — reads items from React Fiber (preferred) or DOM (fallback)
@@ -431,7 +316,7 @@ const CONFIG = {
         const pc = FiberUtil.findPageComponent();
         if (pc) return pc.memoizedProps?.basePageData?.selectedChild?.directedId ?? null;
       }
-      return ApiLayer._childId ?? null;
+      return null;
     },
   };
 
@@ -465,81 +350,14 @@ const CONFIG = {
   };
 
   // --------------------------------------------------------------------------
-  // Toggle Engine
+  // Toggle Engine — uses DOM card clicks (the only method that persists)
   // --------------------------------------------------------------------------
   const Engine = {
     _processedIds: new Set(),
-    _stats: { toggled: 0, skipped: 0, failed: 0, retried: 0 },
-    _useApi: false,
+    _stats: { toggled: 0, skipped: 0, failed: 0 },
 
     async init() {
-      // Try to discover API by triggering one real toggle on a processable item
-      const items = ItemSource.getItems();
-      const firstTarget = items.find((item) => Filter.shouldProcess(item));
-
-      if (firstTarget) {
-        // We need a DOM card element to click for API discovery
-        let cardEl = firstTarget._domCard;
-        if (!cardEl) {
-          // Find card by matching title in aria-labels
-          const switches = document.querySelectorAll('input[role="switch"]');
-          for (const sw of switches) {
-            if ((sw.getAttribute('aria-label') || '').includes(firstTarget.title)) {
-              cardEl = sw.closest('.content-card-clickable');
-              break;
-            }
-          }
-        }
-
-        if (cardEl && !CONFIG.dryRun) {
-          Logger.info('Discovering API by toggling one item...');
-          this._useApi = await ApiLayer.discover(cardEl);
-          // Mark this item as processed (the discovery click already toggled it)
-          this._processedIds.add(firstTarget.itemId ?? firstTarget.title);
-          this._stats.toggled++;
-
-          if (this._useApi) {
-            Logger.info('API discovered — using direct API calls (fast mode)');
-          } else {
-            Logger.info('API discovery failed — using DOM clicks (slower)');
-          }
-        }
-      } else {
-        Logger.info('No items to process on current page');
-      }
-    },
-
-    // Toggle a single item via DOM click (fallback path)
-    async toggleItemDOM(item) {
-      const cardEl = item._domCard || this._findCardByTitle(item.title);
-      if (!cardEl) {
-        Logger.verbose(`Cannot toggle "${item.title}" — no DOM element found`);
-        this._stats.failed++;
-        return;
-      }
-      cardEl.click();
-      await sleep(CONFIG.clickDelayMs);
-      this._stats.toggled++;
-    },
-
-    // Sync UI: visually flip toggle switches to reflect the API change
-    _syncUI(items) {
-      const targetChecked = CONFIG.mode === 'enable';
-      // Build a set of titles to match
-      const titles = new Set(items.map((i) => i.title));
-      const switches = document.querySelectorAll('input[role="switch"]');
-      for (const sw of switches) {
-        const label = sw.getAttribute('aria-label') || '';
-        // aria-label format: "Title, ContentType" — extract title part
-        const lastComma = label.lastIndexOf(', ');
-        const swTitle = lastComma >= 0 ? label.substring(0, lastComma) : label;
-        if (titles.has(swTitle)) {
-          sw.checked = targetChecked;
-          sw.setAttribute('aria-checked', String(targetChecked));
-          titles.delete(swTitle);
-          if (titles.size === 0) break;
-        }
-      }
+      Logger.info('Using DOM card clicks to toggle items');
     },
 
     _findCardByTitle(title) {
@@ -550,6 +368,19 @@ const CONFIG = {
         }
       }
       return null;
+    },
+
+    // Wait for a card click to be acknowledged (switch state changes)
+    _waitForToggle(sw, expectedChecked, timeoutMs = 3000) {
+      return new Promise((resolve) => {
+        const start = Date.now();
+        const check = () => {
+          if (sw.checked === expectedChecked) { resolve(true); return; }
+          if (Date.now() - start > timeoutMs) { resolve(false); return; }
+          setTimeout(check, 50);
+        };
+        setTimeout(check, 50);
+      });
     },
 
     async processBatch(items) {
@@ -573,44 +404,56 @@ const CONFIG = {
         return;
       }
 
-      const apiStatus = CONFIG.mode === 'disable' ? 'BLOCK' : 'ALLOW';
+      const expectChecked = CONFIG.mode === 'enable';
 
-      if (this._useApi && toProcess.every((i) => i.itemId)) {
-        // Batch API calls — send multiple ASINs per request
-        for (let i = 0; i < toProcess.length; i += CONFIG.apiBatchSize) {
-          if (!State.isRunning()) break;
-          await State.checkPause();
+      // Process in concurrent chunks
+      for (let i = 0; i < toProcess.length; i += CONFIG.clickConcurrency) {
+        if (!State.isRunning()) break;
+        await State.checkPause();
 
-          const chunk = toProcess.slice(i, i + CONFIG.apiBatchSize);
-          const asins = chunk.map((item) => item.itemId);
+        const chunk = toProcess.slice(i, i + CONFIG.clickConcurrency);
 
-          for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
-            try {
-              await ApiLayer.toggleViaApi(asins, apiStatus);
-              this._stats.toggled += chunk.length;
-              Logger.verbose(`Batch ${CONFIG.mode}d ${chunk.length} items`);
-              // Sync UI so toggles visually flip
-              this._syncUI(chunk);
-              break;
-            } catch (err) {
-              if (attempt < CONFIG.maxRetries) {
-                const delay = CONFIG.retryBackoffMs * Math.pow(2, attempt);
-                Logger.info(`Batch retry ${attempt + 1}/${CONFIG.maxRetries} (${chunk.length} items) in ${delay}ms: ${err.message}`);
-                this._stats.retried++;
-                await sleep(delay);
-              } else {
-                Logger.info(`Batch FAILED after ${CONFIG.maxRetries} retries (${chunk.length} items): ${err.message}`);
-                this._stats.failed += chunk.length;
-              }
-            }
+        // Click all items in this chunk simultaneously
+        const clickPromises = chunk.map((item) => {
+          const cardEl = item._domCard || this._findCardByTitle(item.title);
+          if (!cardEl) {
+            Logger.verbose(`Cannot toggle "${item.title}" — no DOM element found`);
+            this._stats.failed++;
+            return Promise.resolve();
           }
-        }
-      } else {
-        // Sequential DOM clicks (fallback)
-        for (const item of toProcess) {
-          if (!State.isRunning()) break;
-          await State.checkPause();
-          await this.toggleItemDOM(item);
+
+          // Find the switch to verify the click worked
+          const sw = cardEl.querySelector('input[role="switch"]');
+          cardEl.click();
+
+          if (sw) {
+            return this._waitForToggle(sw, expectChecked).then((ok) => {
+              if (ok) {
+                this._stats.toggled++;
+              } else {
+                // Retry once
+                Logger.verbose(`Retrying toggle for "${item.title}"`);
+                cardEl.click();
+                return this._waitForToggle(sw, expectChecked, 3000).then((ok2) => {
+                  if (ok2) {
+                    this._stats.toggled++;
+                  } else {
+                    Logger.verbose(`Failed to toggle "${item.title}"`);
+                    this._stats.failed++;
+                  }
+                });
+              }
+            });
+          } else {
+            this._stats.toggled++;
+            return Promise.resolve();
+          }
+        });
+
+        await Promise.all(clickPromises);
+        // Small delay between chunks to avoid overwhelming the page
+        if (i + CONFIG.clickConcurrency < toProcess.length) {
+          await sleep(CONFIG.clickDelayMs);
         }
       }
     },
