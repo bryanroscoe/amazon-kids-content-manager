@@ -394,7 +394,8 @@ const CONFIG = {
 
     async processBatch(items) {
       const toProcess = items.filter((item) => {
-        const key = item.itemId ?? item.title;
+        // Use DOM switch as unique key (handles duplicate itemIds/titles)
+        const key = item._domSwitch ?? item.itemId ?? item.title;
         return !this._processedIds.has(key) && Filter.shouldProcess(item);
       });
 
@@ -402,7 +403,7 @@ const CONFIG = {
 
       // Mark all as processed upfront to avoid double-processing
       for (const item of toProcess) {
-        this._processedIds.add(item.itemId ?? item.title);
+        this._processedIds.add(item._domSwitch ?? item.itemId ?? item.title);
       }
 
       if (CONFIG.dryRun) {
