@@ -334,9 +334,12 @@ const CONFIG = {
   // --------------------------------------------------------------------------
   const Filter = {
     shouldProcess(item) {
+      // Use live DOM switch state if available (fiber data can be stale)
+      const isEnabled = item._domSwitch ? item._domSwitch.checked : item.isEnabled;
+
       // Mode check: disable mode processes enabled items, enable mode processes disabled
-      if (CONFIG.mode === 'disable' && !item.isEnabled) return false;
-      if (CONFIG.mode === 'enable' && item.isEnabled) return false;
+      if (CONFIG.mode === 'disable' && !isEnabled) return false;
+      if (CONFIG.mode === 'enable' && isEnabled) return false;
 
       // Content type filter
       if (CONFIG.contentTypes) {
