@@ -242,10 +242,16 @@ const CONFIG = {
 
       const childId = props.basePageData?.selectedChild?.directedId;
 
-      return items.map((item) => {
+      // Pair fiber items with DOM switches by index (they're in the same order)
+      const switches = document.querySelectorAll('input[role="switch"]');
+
+      return items.map((item, idx) => {
         const accessVal = item.childDirectedIdAccessMap?.[childId];
         // "AVAILABLE" means enabled/allowed, anything else means disabled
         const isEnabled = accessVal === 'AVAILABLE';
+
+        const sw = switches[idx] ?? null;
+        const card = sw?.closest('.content-card-clickable') ?? null;
 
         return {
           itemId: item.itemId,
@@ -253,6 +259,8 @@ const CONFIG = {
           contentType: item.activityCategory,
           isEnabled,
           _childId: childId,
+          _domSwitch: sw,
+          _domCard: card,
         };
       });
     },
@@ -287,7 +295,8 @@ const CONFIG = {
       const buttons = document.querySelectorAll('button');
       let showMoreBtn = null;
       for (const btn of buttons) {
-        if (btn.textContent.includes('Show more')) { showMoreBtn = btn; break; }
+        const txt = btn.textContent.toLowerCase();
+        if (txt.includes('show more')) { showMoreBtn = btn; break; }
       }
       // Also try old selector as last resort
       if (!showMoreBtn) showMoreBtn = document.querySelector('.pd-margin-top .css-mnocv9');
@@ -422,8 +431,8 @@ const CONFIG = {
             return Promise.resolve();
           }
 
-          // Find the switch to verify the click worked
-          const sw = cardEl.querySelector('input[role="switch"]');
+          // Use stored switch ref or find from card
+          const sw = item._domSwitch || cardEl.querySelector('input[role="switch"]');
           cardEl.click();
 
           if (sw) {
