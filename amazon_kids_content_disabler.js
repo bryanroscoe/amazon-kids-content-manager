@@ -397,19 +397,8 @@ const CONFIG = {
     },
 
     getPagination() {
-      if (this._fiberAvailable) {
-        const pc = FiberUtil.findPageComponent();
-        if (pc) {
-          const props = pc.memoizedProps;
-          return {
-            nextPageToken: props.itemProps?.nextPageToken ?? null,
-            isLastPage: props.itemProps?.isLastPage ?? true,
-            isLoading: props.itemProps?.isLoading ?? false,
-            fetchItems: props.fetchItems,
-          };
-        }
-      }
-      // DOM fallback: look for "Show more" button
+      // Find the "Show more" button — always use DOM click for pagination
+      // (the React fetchItems function has a complex 9-arg signature we can't replicate)
       const buttons = document.querySelectorAll('button');
       let showMoreBtn = null;
       for (const btn of buttons) {
@@ -418,11 +407,22 @@ const CONFIG = {
       // Also try old selector as last resort
       if (!showMoreBtn) showMoreBtn = document.querySelector('.pd-margin-top .css-mnocv9');
 
+      // Use fiber for reading state (isLastPage, isLoading) if available
+      let isLastPage = !showMoreBtn;
+      let isLoading = false;
+      if (this._fiberAvailable) {
+        const pc = FiberUtil.findPageComponent();
+        if (pc) {
+          const props = pc.memoizedProps;
+          isLastPage = props.itemProps?.isLastPage ?? isLastPage;
+          isLoading = props.itemProps?.isLoading ?? false;
+        }
+      }
+
       return {
-        nextPageToken: null,
-        isLastPage: !showMoreBtn,
-        isLoading: false,
-        fetchItems: showMoreBtn ? () => showMoreBtn.click() : null,
+        isLastPage,
+        isLoading,
+        loadMore: showMoreBtn ? () => showMoreBtn.click() : null,
       };
     },
 
@@ -672,7 +672,7 @@ const CONFIG = {
         break;
       }
 
-      if (!pagination.fetchItems) {
+      if (!pagination.loadMore) {
         Logger.info('No more pages to load');
         break;
       }
@@ -684,23 +684,10 @@ const CONFIG = {
         continue;
       }
 
-      // Load next page
+      // Load next page by clicking "Show more" button
       Logger.verbose('Loading next page...');
       const prevCount = items.length;
-
-      if (pagination.nextPageToken && typeof pagination.fetchItems === 'function') {
-        try {
-          pagination.fetchItems(pagination.nextPageToken);
-        } catch (e) {
-          Logger.verbose(`fetchItems() threw: ${e.message} — trying button click`);
-          const btn = Array.from(document.querySelectorAll('button')).find(
-            (b) => b.textContent.includes('Show more')
-          );
-          if (btn) btn.click();
-        }
-      } else {
-        pagination.fetchItems();
-      }
+      pagination.loadMore();
 
       await waitForNewItems(prevCount);
       await sleep(CONFIG.pageDelayMs);
