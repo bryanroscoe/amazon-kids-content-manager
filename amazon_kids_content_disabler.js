@@ -36,14 +36,14 @@ const CONFIG = {
   // Case-insensitive keyword matching
   keywordCaseSensitive: false,
 
-  // How many parallel API toggle requests (when using direct API)
-  apiConcurrency: 5,
+  // Max ASINs per single API call (the endpoint accepts arrays)
+  apiBatchSize: 30,
 
   // Delay between individual DOM clicks in ms (fallback mode)
   clickDelayMs: 150,
 
   // Delay between pagination loads in ms
-  pageDelayMs: 500,
+  pageDelayMs: 100,
 
   // Max retries per failed toggle
   maxRetries: 3,
@@ -509,57 +509,35 @@ const CONFIG = {
       }
     },
 
-    async toggleItem(item) {
-      const key = item.itemId ?? item.title;
-      if (this._processedIds.has(key)) return;
-      this._processedIds.add(key);
-
-      if (!Filter.shouldProcess(item)) {
-        this._stats.skipped++;
+    // Toggle a single item via DOM click (fallback path)
+    async toggleItemDOM(item) {
+      const cardEl = item._domCard || this._findCardByTitle(item.title);
+      if (!cardEl) {
+        Logger.verbose(`Cannot toggle "${item.title}" — no DOM element found`);
+        this._stats.failed++;
         return;
       }
+      cardEl.click();
+      await sleep(CONFIG.clickDelayMs);
+      this._stats.toggled++;
+    },
 
-      if (CONFIG.dryRun) {
-        Logger.verbose(`[DRY RUN] Would ${CONFIG.mode}: "${item.title}" (${item.contentType})`);
-        this._stats.skipped++;
-        return;
-      }
-
-      const apiStatus = CONFIG.mode === 'disable' ? 'BLOCK' : 'ALLOW';
-
-      for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
-        try {
-          if (this._useApi && item.itemId) {
-            await ApiLayer.toggleViaApi(item.itemId, apiStatus);
-          } else if (item._domCard) {
-            item._domCard.click();
-            await sleep(CONFIG.clickDelayMs);
-          } else {
-            // Find card from DOM by title match
-            const card = this._findCardByTitle(item.title);
-            if (card) {
-              card.click();
-              await sleep(CONFIG.clickDelayMs);
-            } else {
-              Logger.verbose(`Cannot toggle "${item.title}" — no DOM element found`);
-              this._stats.failed++;
-              return;
-            }
-          }
-
-          this._stats.toggled++;
-          Logger.verbose(`${CONFIG.mode === 'disable' ? 'Disabled' : 'Enabled'}: "${item.title}"`);
-          return;
-        } catch (err) {
-          if (attempt < CONFIG.maxRetries) {
-            const delay = CONFIG.retryBackoffMs * Math.pow(2, attempt);
-            Logger.info(`Retry ${attempt + 1}/${CONFIG.maxRetries} for "${item.title}" in ${delay}ms: ${err.message}`);
-            this._stats.retried++;
-            await sleep(delay);
-          } else {
-            Logger.info(`FAILED after ${CONFIG.maxRetries} retries: "${item.title}" — ${err.message}`);
-            this._stats.failed++;
-          }
+    // Sync UI: visually flip toggle switches to reflect the API change
+    _syncUI(items) {
+      const targetChecked = CONFIG.mode === 'enable';
+      // Build a set of titles to match
+      const titles = new Set(items.map((i) => i.title));
+      const switches = document.querySelectorAll('input[role="switch"]');
+      for (const sw of switches) {
+        const label = sw.getAttribute('aria-label') || '';
+        // aria-label format: "Title, ContentType" — extract title part
+        const lastComma = label.lastIndexOf(', ');
+        const swTitle = lastComma >= 0 ? label.substring(0, lastComma) : label;
+        if (titles.has(swTitle)) {
+          sw.checked = targetChecked;
+          sw.setAttribute('aria-checked', String(targetChecked));
+          titles.delete(swTitle);
+          if (titles.size === 0) break;
         }
       }
     },
@@ -582,26 +560,57 @@ const CONFIG = {
 
       if (toProcess.length === 0) return;
 
-      if (this._useApi && toProcess.every((i) => i.itemId)) {
-        // Parallel API calls with concurrency limit
-        const queue = [...toProcess];
-        const workers = [];
-        for (let i = 0; i < Math.min(CONFIG.apiConcurrency, queue.length); i++) {
-          workers.push((async () => {
-            while (queue.length > 0 && State.isRunning()) {
-              await State.checkPause();
-              const item = queue.shift();
-              if (item) await this.toggleItem(item);
-            }
-          })());
+      // Mark all as processed upfront to avoid double-processing
+      for (const item of toProcess) {
+        this._processedIds.add(item.itemId ?? item.title);
+      }
+
+      if (CONFIG.dryRun) {
+        for (const item of toProcess) {
+          Logger.verbose(`[DRY RUN] Would ${CONFIG.mode}: "${item.title}" (${item.contentType})`);
         }
-        await Promise.all(workers);
+        this._stats.skipped += toProcess.length;
+        return;
+      }
+
+      const apiStatus = CONFIG.mode === 'disable' ? 'BLOCK' : 'ALLOW';
+
+      if (this._useApi && toProcess.every((i) => i.itemId)) {
+        // Batch API calls — send multiple ASINs per request
+        for (let i = 0; i < toProcess.length; i += CONFIG.apiBatchSize) {
+          if (!State.isRunning()) break;
+          await State.checkPause();
+
+          const chunk = toProcess.slice(i, i + CONFIG.apiBatchSize);
+          const asins = chunk.map((item) => item.itemId);
+
+          for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
+            try {
+              await ApiLayer.toggleViaApi(asins, apiStatus);
+              this._stats.toggled += chunk.length;
+              Logger.verbose(`Batch ${CONFIG.mode}d ${chunk.length} items`);
+              // Sync UI so toggles visually flip
+              this._syncUI(chunk);
+              break;
+            } catch (err) {
+              if (attempt < CONFIG.maxRetries) {
+                const delay = CONFIG.retryBackoffMs * Math.pow(2, attempt);
+                Logger.info(`Batch retry ${attempt + 1}/${CONFIG.maxRetries} (${chunk.length} items) in ${delay}ms: ${err.message}`);
+                this._stats.retried++;
+                await sleep(delay);
+              } else {
+                Logger.info(`Batch FAILED after ${CONFIG.maxRetries} retries (${chunk.length} items): ${err.message}`);
+                this._stats.failed += chunk.length;
+              }
+            }
+          }
+        }
       } else {
-        // Sequential DOM clicks
+        // Sequential DOM clicks (fallback)
         for (const item of toProcess) {
           if (!State.isRunning()) break;
           await State.checkPause();
-          await this.toggleItem(item);
+          await this.toggleItemDOM(item);
         }
       }
     },
@@ -624,9 +633,9 @@ const CONFIG = {
           resolve();
           return;
         }
-        setTimeout(check, 300);
+        setTimeout(check, 150);
       };
-      setTimeout(check, 300);
+      setTimeout(check, 150);
     });
   }
 
